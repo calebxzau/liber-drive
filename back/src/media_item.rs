@@ -3,7 +3,6 @@ use std::ffi::OsStr;
 use image::imageops::FilterType;
 use image::io::Reader;
 use image::{DynamicImage, ImageBuffer, Rgb};
-use rgb::ComponentMap;
 use std::fs::File;
 use std::io::{BufReader, Cursor, Read};
 use std::path::Path;
@@ -12,10 +11,6 @@ use std::{fs, path::PathBuf, time::UNIX_EPOCH};
 use std::cell::RefCell;
 use std::rc::Rc;
 use std::sync::Arc;
-use aom_decode::avif::{Avif, Image};
-use aom_decode::Config;
-use libheif_rs::{ColorSpace, HeifContext, LibHeif, RgbChroma};
-//use libheif_rs::{ColorSpace, HeifContext, LibHeif, RgbChroma};
 use log::{debug, info};
 use serde::{Deserialize, Serialize};
 use webp::WebPMemory;
@@ -111,8 +106,8 @@ impl MediaItem {
                 let mut img_reader = Reader::new(reader).with_guessed_format()?;
                 img_reader.no_limits();
                 img_reader.decode()?
-            } else if is_heif_image(path) {
-                media_item::decode_heif_image(path.to_str().unwrap())?
+            } else if is_heif_image(path) || is_avif_image(path) {
+                media_item::decode_still_image_with_ffmpeg(path)?
             } else {
                 return Err(format!("{:?} 格式不支持解码", path).into());
             }
@@ -222,72 +217,41 @@ impl MediaItem {
                 self.name)
     }
 }
-pub fn decode_avif_image(path: &Path) -> ResultAnyErr<()> {
-    let file = std::fs::read(path)?;
-    let out_path = Path::new( "example.png");
-    let mut d = Avif::decode(&file, &Config {
-        threads: num_cpus::get(),
-    })?;
-    print!("111");
-    match d.convert()? {
-        Image::RGB8(img) => {
-            let (out, width, height) = img.into_contiguous_buf();
-            lodepng::encode24_file(&out_path, &out, width, height)
-        },
-        Image::RGBA8(img) => {
-            let (out, width, height) = img.into_contiguous_buf();
-            lodepng::encode32_file(&out_path, &out, width, height)
-        },
-        Image::Gray8(img) => {
-            let (out, width, height) = img.into_contiguous_buf();
-            lodepng::encode_file(&out_path, &out, width, height, lodepng::ColorType::GREY, 8)
-        },
-        // 16-bit PNG are huuuge, so save as 8-bit anyway.
-        Image::RGB16(img) => {
-            let mut out = Vec::new();
-            for px in img.pixels() {
-                out.push(px.map(|c| (c >> 8) as u8));
-            }
-            lodepng::encode24_file(&out_path, &out, img.width(), img.height())
-        },
-        Image::RGBA16(img) => {
-            let mut out = Vec::new();
-            for px in img.pixels() {
-                out.push(px.map(|c| (c >> 8) as u8));
-            }
-            lodepng::encode32_file(&out_path, &out, img.width(), img.height())
-        },
-        Image::Gray16(img) => {
-            let mut out = Vec::new();
-            for px in img.pixels() {
-                out.push((px >> 8) as u8);
-            }
-            lodepng::encode_file(&out_path, &out, img.width(), img.height(), lodepng::ColorType::GREY, 8)
-        },
-    }?;
-    Ok( ())
-
+//运行ffmpeg 输出一帧图片到stdout 返回图片字节
+//用output()而不是spawn() 保证子进程被wait回收 不会留下zombie
+fn run_ffmpeg_single_frame(input: &OsStr, extra_args: &[&str]) -> ResultAnyErr<Vec<u8>> {
+    let output = Command::new("ffmpeg")
+        .arg("-nostdin")
+        .arg("-v")
+        .arg("error")
+        .arg("-i")
+        .arg(input)
+        .arg("-frames:v")
+        .arg("1")
+        .arg("-f")
+        .arg("image2pipe")
+        .args(extra_args)
+        .arg("-")
+        .stdin(Stdio::null())
+        .output()?;
+    if !output.status.success() {
+        return Err(format!(
+            "ffmpeg failed ({}) for {:?}: {}",
+            output.status,
+            input,
+            String::from_utf8_lossy(&output.stderr).trim()
+        )
+        .into());
+    }
+    Ok(output.stdout)
 }
-//解码heif图片为DynamicImage
- pub fn decode_heif_image(path: &str) -> ResultAnyErr<DynamicImage> {
-    let lib_heif = LibHeif::new();
-    let ctx = HeifContext::read_from_file(path)?;
-    let handle = ctx.primary_image_handle()?;
-    let image = lib_heif.decode(&handle, ColorSpace::Rgb(RgbChroma::Rgb), None)?;
-    let width = image.width();
-    let height = image.height();
-    let planes = image.planes();
-    let interleaved_plane = planes.interleaved.unwrap();
-    let img = match ImageBuffer::from_raw(width, height, interleaved_plane.data.to_owned())
-        .map(DynamicImage::ImageRgb8)
-    {
-        Some(a) => a,
-        None => {
-            return Err(format!("无法解码图片{}", path).into());
-        }
-    };
-    Ok(img)
-} 
+pub fn decode_still_image_with_ffmpeg(path: &Path) -> ResultAnyErr<DynamicImage> {
+    let buffer = run_ffmpeg_single_frame(path.as_os_str(), &["-vcodec", "png"])?;
+    let cursor = Cursor::new(buffer);
+    let mut img_reader = Reader::new(cursor).with_guessed_format()?;
+    img_reader.no_limits();
+    Ok(img_reader.decode()?)
+}
 //压缩图片为webp格式
 pub fn compress_image_webp(image: &DynamicImage, thumbnail: bool) -> ResultAnyErr<WebPMemory> {
     let (width, height) = (image.width(), image.height());
@@ -331,10 +295,10 @@ pub fn is_video(path: &PathBuf) -> bool {
 }
 //是否图片
 pub fn is_image(path: &PathBuf) -> bool {
-    is_jpg_image(path) || is_avif_image(path)
+    is_jpg_image(path) || is_heif_image(path) || is_avif_image(path)
 }
 pub fn is_jpg_image(path: &PathBuf) -> bool {
-    matches_extension(path, &["jpg"])
+    matches_extension(path, &["jpg", "jpeg"])
 }
 pub fn is_avif_image(path: &PathBuf) -> bool {
     matches_extension(path, &["avif"])
@@ -345,12 +309,12 @@ pub fn is_heif_image(path: &PathBuf) -> bool {
 //文件创建时间timestamp
 pub fn get_file_created_time(path: &PathBuf) -> std::result::Result<u64, AnyError> {
     let meta = fs::metadata(&path)?;
-    let time = meta
-        .created()
-        .unwrap()
-        .duration_since(UNIX_EPOCH)
-        .unwrap()
-        .as_secs();
+    let system_time = match meta.created() {
+        Ok(time) => time,
+        Err(e) if e.kind() == std::io::ErrorKind::Unsupported => meta.modified()?,
+        Err(e) => return Err(e.into()),
+    };
+    let time = system_time.duration_since(UNIX_EPOCH)?.as_secs();
     Ok(time)
 }
 pub fn get_file_size(path: &PathBuf) -> ResultAnyErr<u64> {
@@ -359,22 +323,7 @@ pub fn get_file_size(path: &PathBuf) -> ResultAnyErr<u64> {
 }
 //读取视频第一帧
 pub fn get_video_first_frame(video_path: String) -> ResultAnyErr<DynamicImage> {
-    let mut ffmpeg_output = Command::new("ffmpeg")
-        .arg("-i") // input file
-        .arg(video_path) // replace with your file
-        .arg("-vframes") // number of video frames to output
-        .arg("1") // we only want the first frame
-        .arg("-f") // force format
-        .arg("image2pipe") // pipe image data to stdout
-        .arg("-") // output to stdout
-        .stdout(Stdio::piped()) // capture stdout
-        .spawn()?
-        .stdout
-        .ok_or("can not capture stdout")?;
-
-    let mut buffer = Vec::new();
-    ffmpeg_output.read_to_end(&mut buffer)?;
-
+    let buffer = run_ffmpeg_single_frame(OsStr::new(&video_path), &[])?;
     let cursor = Cursor::new(buffer);
 
     let img = image::io::Reader::new(cursor)

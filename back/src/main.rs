@@ -1,5 +1,5 @@
 use std::collections::HashMap;
-use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
+use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::path::PathBuf;
 use std::{env, fs};
 use std::sync::Arc;
@@ -8,7 +8,7 @@ use axum::body::Body;
 use axum::extract::{Path, Query, State};
 use axum::http::header::CONTENT_TYPE;
 use axum_server::tls_rustls::RustlsConfig;
-use log::info;
+use log::{info, warn};
 
 use axum::http::Extensions;
 use axum::http::HeaderMap;
@@ -236,29 +236,46 @@ async fn main() {
                 .allow_headers(Any),
         );
 
-    let config =
-        RustlsConfig::from_pem_file(PathBuf::from("../../1.crt"), PathBuf::from("../../1.key"))
-            .await
-            .unwrap();
-    info!("ready");
+    let cert_path = env::var_os("LIBER_DRIVE_TLS_CERT")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from("../../1.crt"));
+    let key_path = env::var_os("LIBER_DRIVE_TLS_KEY")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from("../../1.key"));
+    let addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), 7789);
 
-    // Create the first server
-    let server_v4 = axum_server::bind_rustls(
-        SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), 7789),
-        config.clone(),
-    )
-        .serve(app.clone().into_make_service());
-
-    // Create the second server
-    let server_v6 = axum_server::bind_rustls(
-        SocketAddr::new(IpAddr::V6(Ipv6Addr::UNSPECIFIED), 7789),
-        config.clone(),
-    )
-        .serve(app.clone().into_make_service());
-
-    // Use tokio::try_join! to run both servers concurrently
-    match tokio::try_join!(server_v4, server_v6) {
-        Ok(_) => info!("Servers ran successfully"),
-        Err(e) => eprintln!("Server error: {}", e),
+    if cert_path.exists() && key_path.exists() {
+        match RustlsConfig::from_pem_file(&cert_path, &key_path).await {
+            Ok(config) => {
+                info!("ready https");
+                let server = axum_server::bind_rustls(addr, config)
+                    .serve(app.clone().into_make_service());
+                if let Err(e) = server.await {
+                    eprintln!("Server error: {}", e);
+                }
+            }
+            Err(e) => {
+                warn!(
+                    "TLS证书加载失败，将使用HTTP启动: cert={}, key={}, error={}",
+                    cert_path.display(),
+                    key_path.display(),
+                    e
+                );
+                let server = axum_server::bind(addr).serve(app.clone().into_make_service());
+                if let Err(e) = server.await {
+                    eprintln!("Server error: {}", e);
+                }
+            }
+        }
+    } else {
+        warn!(
+            "TLS证书不存在，将使用HTTP启动: cert={}, key={}",
+            cert_path.display(),
+            key_path.display()
+        );
+        let server = axum_server::bind(addr).serve(app.clone().into_make_service());
+        if let Err(e) = server.await {
+            eprintln!("Server error: {}", e);
+        }
     }
 }
